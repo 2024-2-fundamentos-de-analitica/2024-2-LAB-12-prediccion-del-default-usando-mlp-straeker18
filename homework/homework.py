@@ -96,3 +96,185 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+import pandas as pd
+import gzip
+import pickle
+import json
+import os
+from glob import glob
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.decomposition import PCA
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import (
+    precision_score, balanced_accuracy_score, recall_score, f1_score, confusion_matrix
+)
+from sklearn.model_selection import GridSearchCV
+
+
+# Función 1: Cargar datos
+def load_data():
+    dataframe_test = pd.read_csv(
+        "./files/input/test_data.csv.zip",
+        index_col=False,
+        compression="zip",
+    )
+
+    dataframe_train = pd.read_csv(
+        "./files/input/train_data.csv.zip",
+        index_col=False,
+        compression="zip",
+    )
+
+    return dataframe_train, dataframe_test
+
+
+# Función 2: Limpiar datos
+def clean_data(df):
+    df_copy = df.copy()
+    df_copy = df_copy.rename(columns={'default payment next month': "default"})
+    df_copy = df_copy.drop(columns=["ID"])
+    df_copy = df_copy.loc[df["MARRIAGE"] != 0]
+    df_copy = df_copy.loc[df["EDUCATION"] != 0]
+    df_copy["EDUCATION"] = df_copy["EDUCATION"].apply(lambda x: 4 if x >= 4 else x)
+    df_copy = df_copy.dropna()
+    return df_copy
+
+
+# Función 3: Dividir datos en características y etiquetas
+def split_data(df):
+    return df.drop(columns=["default"]), df["default"]
+
+
+# Función 4: Crear pipeline
+def make_pipeline(x_train):
+    categorical_features = ["SEX", "EDUCATION", "MARRIAGE"]
+    numerical_features = [col for col in x_train.columns if col not in categorical_features]
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('cat', OneHotEncoder(), categorical_features),
+            ('scaler', StandardScaler(), numerical_features),
+        ]
+    )
+
+    pipeline = Pipeline([
+        ("preprocessor", preprocessor),
+        ('feature_selection', SelectKBest(score_func=f_classif)),
+        ('pca', PCA()),
+        ('classifier', MLPClassifier(max_iter=15000, random_state=21))
+    ])
+
+    return pipeline
+
+
+# Función 5: Optimizar hiperparámetros
+def create_estimator(pipeline):
+    param_grid = {
+        "pca__n_components": [None],
+        "feature_selection__k": [20],
+        "classifier__hidden_layer_sizes": [(50, 30, 40, 60)],
+        "classifier__alpha": [0.26],
+        'classifier__learning_rate_init': [0.001],
+    }
+
+    grid_search = GridSearchCV(
+        estimator=pipeline,
+        param_grid=param_grid,
+        cv=10,
+        scoring='balanced_accuracy',
+        n_jobs=-1,
+        refit=True
+    )
+
+    return grid_search
+
+
+# Función 6: Guardar modelo
+def _create_output_directory(output_directory):
+    if os.path.exists(output_directory):
+        for file in glob(f"{output_directory}/*"):
+            os.remove(file)
+        os.rmdir(output_directory)
+    os.makedirs(output_directory)
+
+
+def _save_model(path, estimator):
+    _create_output_directory("files/models/")
+    with gzip.open(path, "wb") as f:
+        pickle.dump(estimator, f)
+
+
+# Función 7: Calcular métricas
+def calculate_metrics(dataset_type, y_true, y_pred):
+    return {
+        "type": "metrics",
+        "dataset": dataset_type,
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "f1_score": f1_score(y_true, y_pred, zero_division=0),
+    }
+
+
+# Función 8: Calcular matriz de confusión
+def calculate_confusion(dataset_type, y_true, y_pred):
+    cm = confusion_matrix(y_true, y_pred)
+    return {
+        "type": "cm_matrix",
+        "dataset": dataset_type,
+        "true_0": {"predicted_0": int(cm[0][0]), "predicted_1": int(cm[0][1])},
+        "true_1": {"predicted_0": int(cm[1][0]), "predicted_1": int(cm[1][1])},
+    }
+
+
+# Función 9: Ejecutar el flujo completo
+def _run_jobs():
+    # Cargar datos
+    data_train, data_test = load_data()
+
+    # Limpiar datos
+    data_train = clean_data(data_train)
+    data_test = clean_data(data_test)
+
+    # Dividir datos
+    x_train, y_train = split_data(data_train)
+    x_test, y_test = split_data(data_test)
+
+    # Crear pipeline
+    pipeline = make_pipeline(x_train)
+
+    # Optimizar hiperparámetros
+    estimator = create_estimator(pipeline)
+    estimator.fit(x_train, y_train)
+
+    # Guardar modelo
+    _save_model(
+        os.path.join("files/models/", "model.pkl.gz"),
+        estimator,
+    )
+
+    # Calcular métricas
+    y_test_pred = estimator.predict(x_test)
+    test_precision_metrics = calculate_metrics("test", y_test, y_test_pred)
+    y_train_pred = estimator.predict(x_train)
+    train_precision_metrics = calculate_metrics("train", y_train, y_train_pred)
+
+    # Calcular matrices de confusión
+    test_confusion_metrics = calculate_confusion("test", y_test, y_test_pred)
+    train_confusion_metrics = calculate_confusion("train", y_train, y_train_pred)
+
+    # Guardar métricas
+    os.makedirs("files/output/", exist_ok=True)
+    with open("files/output/metrics.json", "w", encoding="utf-8") as file:
+        file.write(json.dumps(train_precision_metrics) + "\n")
+        file.write(json.dumps(test_precision_metrics) + "\n")
+        file.write(json.dumps(train_confusion_metrics) + "\n")
+        file.write(json.dumps(test_confusion_metrics) + "\n")
+
+
+# Punto de entrada
+if __name__ == "__main__":
+    _run_jobs()
